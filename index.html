@@ -455,6 +455,7 @@
 
   <div class="status-bar">
     <div class="badge" id="badge-mic"><span class="dot"></span> Mic</div>
+    <div class="badge" id="badge-system"><span class="dot"></span> System</div>
     <div class="badge" id="badge-wake"><span class="dot"></span> Wake Lock</div>
     <div class="badge" id="badge-speech"><span class="dot"></span> <span id="badge-speech-label">Speech</span></div>
     <div class="badge" id="badge-ai"><span class="dot"></span> AI</div>
@@ -488,6 +489,17 @@
     <div class="engine-label" id="engine-desc">
       <b>Auto</b> — Tries browser speech recognition first, falls back to Gemini if it's not working. Recommended for most devices.
     </div>
+
+    <div class="card-title" style="margin-top:18px;"><span class="icon">🔊</span> System Audio Capture</div>
+    <div class="engine-row">
+      <div class="engine-opt" id="system-audio-toggle" style="flex:1;">
+        <div>🖥 Capture Device Audio</div>
+      </div>
+    </div>
+    <div class="engine-label" id="system-audio-desc">
+      Record audio from other apps (Zoom, Teams, etc.) alongside your mic. Requires screen sharing permission. Uses Gemini transcription.
+    </div>
+    <div class="engine-label" id="system-audio-warning" style="display:none; color:#f5a623;"></div>
   </div>
 
   <!-- Record button + timer -->
@@ -532,8 +544,9 @@
 
 <script>
 // ═══════════════════════════════════════════════════════════
-// MeetingUp v2 — Dual-engine transcription
+// MeetingUp v3 — Dual-engine transcription + System Audio Capture
 // Web Speech API on desktop, Gemini audio fallback on mobile
+// System audio via getDisplayMedia (Chrome/Edge), merged with mic
 // ═══════════════════════════════════════════════════════════
 
 const $ = id => document.getElementById(id);
@@ -565,6 +578,14 @@ const state = {
   geminiChunkInterval: null,
   GEMINI_CHUNK_SECONDS: 10,
   geminiTranscribing: false,
+
+  // System audio capture
+  systemAudioEnabled: false,
+  systemAudioStream: null,
+  systemAudioSupported: null,  // null = untested, true/false/'limited'
+  micStream: null,
+  mergedAudioContext: null,
+  mergedDestination: null,
 };
 
 // --- Waveform ---
@@ -601,14 +622,127 @@ const engineDescriptions = {
   gemini: '<b>Gemini</b> — Records audio chunks and sends to Gemini for transcription. Works everywhere. Uses API quota.',
 };
 
-document.querySelectorAll('.engine-opt').forEach(el => {
+document.querySelectorAll('.engine-opt[data-engine]').forEach(el => {
   el.addEventListener('click', () => {
-    document.querySelectorAll('.engine-opt').forEach(e => e.classList.remove('selected'));
+    document.querySelectorAll('.engine-opt[data-engine]').forEach(e => e.classList.remove('selected'));
     el.classList.add('selected');
     state.engine = el.dataset.engine;
     $('engine-desc').innerHTML = engineDescriptions[state.engine];
   });
 });
+
+// --- System Audio Detection & Toggle ---
+function detectSystemAudioSupport() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    return { supported: false, reason: 'Your browser does not support screen capture.' };
+  }
+  const ua = navigator.userAgent;
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
+  const isFirefox = ua.includes('Firefox');
+  const isAndroid = ua.includes('Android');
+
+  if (isIOS) return { supported: false, reason: 'iOS does not allow web apps to capture system audio.' };
+  if (isSafari) return { supported: false, reason: 'Safari does not support audio capture via screen sharing.' };
+  if (isAndroid) return { supported: 'limited', reason: 'System audio capture has limited support on Android. It may not work on all devices.' };
+  if (isFirefox) return { supported: 'limited', reason: 'Firefox only supports capturing audio from a browser tab, not system-wide audio.' };
+  return { supported: true, reason: '' };
+}
+
+(function initSystemAudioToggle() {
+  const detection = detectSystemAudioSupport();
+  state.systemAudioSupported = detection.supported;
+
+  const toggleEl = $('system-audio-toggle');
+  const warningEl = $('system-audio-warning');
+
+  if (detection.supported === false) {
+    toggleEl.style.opacity = '0.4';
+    toggleEl.style.pointerEvents = 'none';
+    warningEl.style.display = '';
+    warningEl.textContent = detection.reason;
+    state.systemAudioEnabled = false;
+    return;
+  }
+
+  if (detection.supported === 'limited') {
+    warningEl.style.display = '';
+    warningEl.textContent = detection.reason;
+  }
+
+  // Restore saved preference
+  try {
+    state.systemAudioEnabled = localStorage.getItem('meetingup_system_audio') === 'true';
+    if (state.systemAudioEnabled) toggleEl.classList.add('selected');
+  } catch(e) {}
+
+  toggleEl.addEventListener('click', () => {
+    state.systemAudioEnabled = !state.systemAudioEnabled;
+    toggleEl.classList.toggle('selected', state.systemAudioEnabled);
+    try { localStorage.setItem('meetingup_system_audio', state.systemAudioEnabled); } catch(e) {}
+  });
+})();
+
+// ═══════════════════════════════════════════════════════════
+// System Audio Capture
+// ═══════════════════════════════════════════════════════════
+async function requestSystemAudio() {
+  try {
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true
+    });
+
+    // Stop video tracks — we only need audio
+    displayStream.getVideoTracks().forEach(t => t.stop());
+
+    const audioTracks = displayStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      toast('No system audio — make sure to check "Share audio" in the dialog');
+      return null;
+    }
+
+    const audioOnlyStream = new MediaStream(audioTracks);
+
+    // Handle user stopping screen share mid-recording
+    audioTracks[0].addEventListener('ended', () => {
+      handleSystemAudioEnded();
+    });
+
+    return audioOnlyStream;
+  } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      toast('System audio permission denied');
+    } else {
+      toast('Could not capture system audio: ' + e.message);
+    }
+    return null;
+  }
+}
+
+function createMergedStream(micStream, systemStream) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const destination = ctx.createMediaStreamDestination();
+
+  const micSource = ctx.createMediaStreamSource(micStream);
+  micSource.connect(destination);
+
+  const systemSource = ctx.createMediaStreamSource(systemStream);
+  systemSource.connect(destination);
+
+  state.mergedAudioContext = ctx;
+  state.mergedDestination = destination;
+
+  return destination.stream;
+}
+
+function handleSystemAudioEnded() {
+  if (!state.recording) return;
+  toast('System audio sharing stopped — continuing with mic only');
+  setBadge('system', 'warning');
+  state.systemAudioStream = null;
+  // Merged stream continues but only mic feeds into it now
+}
 
 // --- Timer ---
 function startTimer() {
@@ -1041,21 +1175,52 @@ async function triggerAISummary() {
 async function startRecording() {
   const apiKey = $('api-key-input').value.trim();
 
-  // If engine is gemini or auto, we need an API key
-  if (state.engine !== 'browser' && !apiKey) {
+  // System audio requires Gemini engine for transcription
+  const wantsSystemAudio = state.systemAudioEnabled && state.systemAudioSupported;
+
+  // If engine is gemini or auto, or system audio is enabled, we need an API key
+  if ((state.engine !== 'browser' || wantsSystemAudio) && !apiKey) {
     toast('Enter your Gemini API key first');
     $('api-key-input').focus();
     return;
   }
 
+  // Request system audio FIRST if enabled (needs fresh user gesture)
+  let systemStream = null;
+  if (wantsSystemAudio) {
+    systemStream = await requestSystemAudio();
+    if (systemStream) {
+      state.systemAudioStream = systemStream;
+      setBadge('system', 'active');
+    } else {
+      setBadge('system', 'warning');
+      toast('Continuing with microphone only');
+    }
+  }
+
   // Request mic
+  let micStream;
   try {
-    state.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.micStream = micStream;
     setBadge('mic', 'active');
   } catch (e) {
     setBadge('mic', 'error');
     toast('Microphone access denied');
+    // Clean up system audio if we got it
+    if (systemStream) {
+      systemStream.getTracks().forEach(t => t.stop());
+      state.systemAudioStream = null;
+      setBadge('system', '');
+    }
     return;
+  }
+
+  // Merge streams if we have system audio, otherwise use mic directly
+  if (systemStream) {
+    state.mediaStream = createMergedStream(micStream, systemStream);
+  } else {
+    state.mediaStream = micStream;
   }
 
   state.recording = true;
@@ -1070,8 +1235,13 @@ async function startRecording() {
   startVisualizer(state.mediaStream);
 
   // --- Engine selection ---
-  if (state.engine === 'browser') {
-    // Force browser speech
+  // When system audio is active, Web Speech API can't hear it (it only uses mic).
+  // Force Gemini engine so the merged stream is transcribed.
+  if (state.systemAudioStream) {
+    toast('Using Gemini transcription for system + mic audio');
+    startGeminiAudioEngine();
+  } else if (state.engine === 'browser') {
+    // Force browser speech (mic only)
     if (!startBrowserSpeech()) {
       toast('Browser speech not available — switch to Auto or Gemini');
       stopRecording();
@@ -1086,7 +1256,6 @@ async function startRecording() {
 
     if (browserStarted) {
       toast('Trying browser speech — will switch to Gemini if needed');
-      // Check after 8 seconds if we got any results
       state.speechCheckTimer = setTimeout(() => {
         if (state.recording && !state.speechResultReceived) {
           console.log('No browser speech results after 8s — switching to Gemini');
@@ -1096,7 +1265,6 @@ async function startRecording() {
         }
       }, 8000);
     } else {
-      // No browser speech available at all — go straight to Gemini
       startGeminiAudioEngine();
     }
   }
@@ -1115,6 +1283,26 @@ function stopRecording() {
   stopBrowserSpeech();
   stopGeminiEngine();
 
+  // Stop mic stream
+  if (state.micStream) {
+    state.micStream.getTracks().forEach(t => t.stop());
+    state.micStream = null;
+  }
+
+  // Stop system audio stream
+  if (state.systemAudioStream) {
+    state.systemAudioStream.getTracks().forEach(t => t.stop());
+    state.systemAudioStream = null;
+  }
+
+  // Close merging AudioContext
+  if (state.mergedAudioContext) {
+    state.mergedAudioContext.close();
+    state.mergedAudioContext = null;
+    state.mergedDestination = null;
+  }
+
+  // Stop merged stream tracks (from MediaStreamDestination)
   if (state.mediaStream) {
     state.mediaStream.getTracks().forEach(t => t.stop());
     state.mediaStream = null;
@@ -1122,9 +1310,11 @@ function stopRecording() {
 
   state.activeEngine = null;
   setBadge('mic', '');
+  setBadge('system', '');
   setBadge('speech', '');
   $('badge-speech-label').textContent = 'Speech';
   toast('Recording stopped');
+  $('setup-card').style.display = '';
 }
 
 $('record-btn').addEventListener('click', () => {
@@ -1187,7 +1377,7 @@ $('api-key-input').addEventListener('change', () => {
   if (key) toast('API key saved');
 });
 
-console.log('MeetingUp v2 loaded — dual engine');
+console.log('MeetingUp v3 loaded — dual engine + system audio capture');
 </script>
 </body>
 </html>
